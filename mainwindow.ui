@@ -1,0 +1,349 @@
+#include "mainwindow.h"
+#include "ui_mainwindow.h"
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QPainter>
+#include <QTime>
+
+// VideoWidget 实现
+VideoWidget::VideoWidget(QWidget *parent) 
+    : QWidget(parent)
+    , m_currentFrame(640, 480, QImage::Format_RGB888)
+{
+    m_currentFrame.fill(Qt::black);
+    setMinimumSize(640, 480);
+}
+
+void VideoWidget::displayFrame(const QImage &image)
+{
+    m_currentFrame = image;
+    update();
+}
+
+void VideoWidget::paintEvent(QPaintEvent *event)
+{
+    Q_UNUSED(event);
+    QPainter painter(this);
+    
+    // 缩放图像以适应窗口
+    QImage scaled = m_currentFrame.scaled(size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    int x = (width() - scaled.width()) / 2;
+    int y = (height() - scaled.height()) / 2;
+    
+    painter.drawImage(x, y, scaled);
+}
+
+// MainWindow 实现
+MainWindow::MainWindow(QWidget *parent)
+    : QMainWindow(parent)
+    , ui(new Ui::MainWindow)
+    , m_isPlaying(false)
+    , m_duration(0)
+    , m_currentTime(0)
+    , m_formatContext(nullptr)
+    , m_codecContext(nullptr)
+    , m_videoStreamIndex(-1)
+    , m_frame(nullptr)
+    , m_frameRGB(nullptr)
+    , m_buffer(nullptr)
+    , m_swsContext(nullptr)
+    , m_packet(nullptr)
+{
+    ui->setupUi(this);
+    setupConnections();
+    initFFmpeg();
+    
+    m_timer = new QTimer(this);
+    connect(m_timer, &QTimer::timeout, this, &MainWindow::updateVideo);
+    
+    // 初始状态
+    ui->playButton->setEnabled(false);
+    ui->stopButton->setEnabled(false);
+}
+
+MainWindow::~MainWindow()
+{
+    cleanupFFmpeg();
+    delete ui;
+}
+
+void MainWindow::setupConnections()
+{
+    // 手动连接信号槽（如果UI设计器中没有自动连接）
+    connect(ui->openButton, &QPushButton::clicked, this, &MainWindow::on_openButton_clicked);
+    connect(ui->playButton, &QPushButton::clicked, this, &MainWindow::on_playButton_clicked);
+    connect(ui->stopButton, &QPushButton::clicked, this, &MainWindow::on_stopButton_clicked);
+    connect(ui->positionSlider, &QSlider::sliderMoved, this, &MainWindow::on_positionSlider_sliderMoved);
+}
+
+bool MainWindow::initFFmpeg()
+{
+    m_frame = av_frame_alloc();
+    m_frameRGB = av_frame_alloc();
+    m_packet = av_packet_alloc();
+    
+    if (!m_frame || !m_frameRGB || !m_packet) {
+        QMessageBox::critical(this, "错误", "无法分配FFmpeg资源");
+        return false;
+    }
+    
+    return true;
+}
+
+void MainWindow::cleanupFFmpeg()
+{
+    if (m_swsContext) {
+        sws_freeContext(m_swsContext);
+        m_swsContext = nullptr;
+    }
+    
+    if (m_buffer) {
+        av_free(m_buffer);
+        m_buffer = nullptr;
+    }
+    
+    if (m_frame) {
+        av_frame_free(&m_frame);
+    }
+    
+    if (m_frameRGB) {
+        av_frame_free(&m_frameRGB);
+    }
+    
+    if (m_packet) {
+        av_packet_free(&m_packet);
+    }
+    
+    if (m_codecContext) {
+        avcodec_free_context(&m_codecContext);
+    }
+    
+    if (m_formatContext) {
+        avformat_close_input(&m_formatContext);
+    }
+}
+
+void MainWindow::on_openButton_clicked()
+{
+    on_actionOpen_triggered();
+}
+
+void MainWindow::on_playButton_clicked()
+{
+    if (!m_formatContext) return;
+    
+    if (m_isPlaying) {
+        m_timer->stop();
+        ui->playButton->setText("播放");
+    } else {
+        m_timer->start(33); // ~30 FPS
+        ui->playButton->setText("暂停");
+    }
+    
+    m_isPlaying = !m_isPlaying;
+}
+
+void MainWindow::on_stopButton_clicked()
+{
+    if (m_formatContext && m_isPlaying) {
+        m_timer->stop();
+        ui->playButton->setText("播放");
+        m_isPlaying = false;
+        
+        // 回到开始位置
+        av_seek_frame(m_formatContext, -1, 0, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(m_codecContext);
+        m_currentTime = 0;
+        ui->positionSlider->setValue(0);
+        ui->timeLabel->setText("00:00:00 / " + formatTime(m_duration));
+    }
+}
+
+void MainWindow::on_positionSlider_sliderMoved(int position)
+{
+    if (!m_formatContext) return;
+    
+    qint64 targetTime = (position * m_duration) / 1000;
+    av_seek_frame(m_formatContext, -1, targetTime * AV_TIME_BASE, AVSEEK_FLAG_BACKWARD);
+    
+    // 清空解码器缓冲区
+    avcodec_flush_buffers(m_codecContext);
+    m_currentTime = targetTime;
+}
+
+void MainWindow::on_actionOpen_triggered()
+{
+    QString filename = QFileDialog::getOpenFileName(
+        this,
+        "打开视频文件",
+        "",
+        "视频文件 (*.mp4 *.avi *.mkv *.mov *.wmv);;所有文件 (*.*)"
+    );
+    
+    if (!filename.isEmpty()) {
+        if (loadVideo(filename)) {
+            ui->playButton->setEnabled(true);
+            ui->stopButton->setEnabled(true);
+            on_playButton_clicked(); // 开始播放
+        }
+    }
+}
+
+void MainWindow::on_actionExit_triggered()
+{
+    close();
+}
+
+void MainWindow::on_actionAbout_triggered()
+{
+    QMessageBox::about(this, "关于 FFmpeg 播放器", 
+                      "FFmpeg MP4 播放器\n\n"
+                      "基于 Qt 和 FFmpeg 开发的视频播放器\n"
+                      "支持 MP4, AVI, MKV, MOV, WMV 等格式");
+}
+
+QString MainWindow::formatTime(qint64 seconds)
+{
+    QTime time(0, 0, 0);
+    time = time.addSecs(seconds);
+    return time.toString("hh:mm:ss");
+}
+
+bool MainWindow::loadVideo(const QString &filename)
+{
+    cleanupFFmpeg();
+    initFFmpeg();
+    
+    // 打开视频文件
+    if (avformat_open_input(&m_formatContext, filename.toLocal8Bit().data(), nullptr, nullptr) != 0) {
+        QMessageBox::critical(this, "错误", "无法打开视频文件");
+        return false;
+    }
+    
+    // 获取流信息
+    if (avformat_find_stream_info(m_formatContext, nullptr) < 0) {
+        QMessageBox::critical(this, "错误", "无法获取流信息");
+        return false;
+    }
+    
+    // 查找视频流
+    m_videoStreamIndex = -1;
+    for (unsigned int i = 0; i < m_formatContext->nb_streams; i++) {
+        if (m_formatContext->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            m_videoStreamIndex = i;
+            break;
+        }
+    }
+    
+    if (m_videoStreamIndex == -1) {
+        QMessageBox::critical(this, "错误", "未找到视频流");
+        return false;
+    }
+    
+    // 获取解码器
+    AVCodecParameters *codecParameters = m_formatContext->streams[m_videoStreamIndex]->codecpar;
+    const AVCodec *codec = avcodec_find_decoder(codecParameters->codec_id);
+    if (!codec) {
+        QMessageBox::critical(this, "错误", "不支持的解码器");
+        return false;
+    }
+    
+    // 创建解码器上下文
+    m_codecContext = avcodec_alloc_context3(codec);
+    if (avcodec_parameters_to_context(m_codecContext, codecParameters) < 0) {
+        QMessageBox::critical(this, "错误", "无法创建解码器上下文");
+        return false;
+    }
+    
+    // 打开解码器
+    if (avcodec_open2(m_codecContext, codec, nullptr) < 0) {
+        QMessageBox::critical(this, "错误", "无法打开解码器");
+        return false;
+    }
+    
+    // 设置持续时间
+    m_duration = m_formatContext->duration / AV_TIME_BASE;
+    
+    // 准备图像转换
+    m_swsContext = sws_getContext(
+        m_codecContext->width,
+        m_codecContext->height,
+        m_codecContext->pix_fmt,
+        m_codecContext->width,
+        m_codecContext->height,
+        AV_PIX_FMT_RGB24,
+        SWS_BILINEAR,
+        nullptr,
+        nullptr,
+        nullptr
+    );
+    
+    // 分配帧缓冲区
+    int numBytes = av_image_get_buffer_size(AV_PIX_FMT_RGB24, m_codecContext->width, m_codecContext->height, 1);
+    m_buffer = (uint8_t *)av_malloc(numBytes * sizeof(uint8_t));
+    av_image_fill_arrays(m_frameRGB->data, m_frameRGB->linesize, m_buffer,
+                        AV_PIX_FMT_RGB24, m_codecContext->width, m_codecContext->height, 1);
+    
+    // 更新UI
+    ui->timeLabel->setText("00:00:00 / " + formatTime(m_duration));
+    ui->positionSlider->setValue(0);
+    
+    return true;
+}
+
+void MainWindow::updateVideo()
+{
+    if (!m_formatContext) return;
+    
+    decodeFrame();
+    
+    // 更新进度条和时间显示
+    if (m_formatContext->duration > 0) {
+        m_currentTime = avio_tell(m_formatContext->pb) / AV_TIME_BASE;
+        int sliderPos = (m_currentTime * 1000) / m_duration;
+        ui->positionSlider->setValue(sliderPos);
+        
+        ui->timeLabel->setText(formatTime(m_currentTime) + " / " + formatTime(m_duration));
+    }
+}
+
+void MainWindow::decodeFrame()
+{
+    int response = 0;
+    
+    while (av_read_frame(m_formatContext, m_packet) >= 0) {
+        if (m_packet->stream_index == m_videoStreamIndex) {
+            response = avcodec_send_packet(m_codecContext, m_packet);
+            if (response < 0) {
+                break;
+            }
+            
+            response = avcodec_receive_frame(m_codecContext, m_frame);
+            if (response == 0) {
+                // 转换帧格式
+                sws_scale(m_swsContext, 
+                         (uint8_t const * const *)m_frame->data,
+                         m_frame->linesize, 0, m_codecContext->height,
+                         m_frameRGB->data, m_frameRGB->linesize);
+                
+                // 创建QImage并显示
+                QImage image(m_frameRGB->data[0], 
+                            m_codecContext->width, 
+                            m_codecContext->height, 
+                            m_frameRGB->linesize[0], 
+                            QImage::Format_RGB888);
+                
+                ui->videoWidget->displayFrame(image);
+                break;
+            }
+        }
+        av_packet_unref(m_packet);
+    }
+    
+    if (response == AVERROR_EOF) {
+        // 视频结束，重新开始
+        av_seek_frame(m_formatContext, -1, 0, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(m_codecContext);
+        m_currentTime = 0;
+    }
+}
